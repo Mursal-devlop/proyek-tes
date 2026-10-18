@@ -316,6 +316,47 @@ async def push_to_github(work_dir: Path, repo_name: str):
     await asyncio.to_thread(push)
 
 
+async def enable_github_pages(repo_name: str) -> str:
+    owner = quote(GITHUB_USERNAME, safe="")
+    repo = quote(repo_name, safe="")
+    pages_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pages"
+
+    def enable():
+        response = requests.post(
+            pages_url,
+            headers=github_headers(),
+            json={"source": {"branch": "main", "path": "/"}},
+            timeout=30,
+        )
+
+        if response.status_code in (200, 201):
+            return response.json().get("html_url")
+
+        # 409 = Pages sudah aktif. Ambil URL-nya saja.
+        if response.status_code == 409:
+            check = requests.get(
+                pages_url,
+                headers=github_headers(),
+                timeout=30,
+            )
+            if check.status_code == 200:
+                return check.json().get("html_url")
+
+        try:
+            message = response.json().get(
+                "message", response.text
+            )
+        except ValueError:
+            message = response.text
+
+        raise RuntimeError(
+            f"GitHub Pages gagal diaktifkan "
+            f"(HTTP {response.status_code}): {message}"
+        )
+
+    return await asyncio.to_thread(enable)
+
+
 # ==================================================
 # PERINTAH TELEGRAM
 # ==================================================
@@ -403,13 +444,33 @@ async def handle_message(
         await push_to_github(work_dir, repo_name)
 
         await status_msg.edit_text(
-            "✅ Website berhasil dibuat dan diunggah!\n\n"
-            f"📦 Repository:\n{repo_url}\n\n"
-            "📄 File website: index.html\n\n"
-            "Catatan: repository sudah berisi kode HTML. "
-            "Untuk menampilkan website secara publik, "
-            "aktifkan GitHub Pages jika diperlukan."
+            "🌐 Mengaktifkan GitHub Pages agar link bisa langsung dibuka..."
         )
+
+        pages_url = None
+        pages_error = None
+        try:
+            pages_url = await enable_github_pages(repo_name)
+        except Exception as exc:
+            pages_error = redact_secrets(str(exc))
+
+        if pages_url:
+            await status_msg.edit_text(
+                "✅ Website berhasil dibuat dan dipublikasikan!\n\n"
+                f"🌐 Link website (langsung buka):\n{pages_url}\n\n"
+                "⏳ Catatan: jika link belum terbuka, tunggu 1-2 menit "
+                "karena GitHub Pages sedang proses build pertama.\n\n"
+                f"📦 Repository:\n{repo_url}"
+            )
+        else:
+            await status_msg.edit_text(
+                "✅ Website berhasil dibuat dan diunggah!\n\n"
+                f"📦 Repository:\n{repo_url}\n\n"
+                "⚠️ GitHub Pages gagal diaktifkan otomatis. "
+                "Aktifkan manual di Settings → Pages "
+                "(Branch: main, Folder: /root).\n\n"
+                f"Detail: {pages_error[:300]}"
+            )
 
     except subprocess.CalledProcessError as exc:
         # Output Git dapat berisi detail teknis. Jangan kirim
