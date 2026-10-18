@@ -1,119 +1,385 @@
+
 import os
+import re
+import asyncio
 import subprocess
+from pathlib import Path
+from urllib.parse import quote
+
 import requests
 from google import genai
+from google.genai import types
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ==================================================
+# KONFIGURASI
+# ==================================================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+# Model baru berdasarkan pesan error yang kamu terima.
+GEMINI_MODEL = "gemini-3.8-flash"
+
+BASE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = BASE_DIR / "workspace"
+
+GITHUB_API_URL = "https://api.github.com"
+
+SYSTEM_INSTRUCTION = """
+Kamu adalah web developer profesional.
+
+Buat website lengkap dalam satu file index.html berdasarkan permintaan pengguna.
+
+Ketentuan:
+1. Gunakan HTML5, Tailwind CSS melalui CDN, dan JavaScript jika diperlukan.
+2. Buat desain modern, responsif, rapi, dan mudah digunakan.
+3. Pastikan struktur HTML lengkap dan valid.
+4. Tambahkan konten yang relevan dengan permintaan pengguna.
+5. Gunakan ikon dari CDN jika diperlukan.
+6. Jangan membuat file terpisah.
+7. Output hanya kode HTML, tanpa Markdown, tanpa penjelasan.
+8. HTML harus dimulai dengan <!DOCTYPE html> dan diakhiri dengan </html>.
+9. Jangan mengarang hasil integrasi backend yang sebenarnya belum tersedia.
+"""
+
+
+# ==================================================
+# VALIDASI KONFIGURASI
+# ==================================================
+
+def validate_config():
+    required = {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "GITHUB_TOKEN": GITHUB_TOKEN,
+        "GITHUB_USERNAME": GITHUB_USERNAME,
+        "GEMINI_API_KEY": GEMINI_API_KEY,
+    }
+
+    missing = [
+        name for name, value in required.items()
+        if not value
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Environment variable belum diisi: "
+            + ", ".join(missing)
+        )
+
+
+# ==================================================
+# GEMINI AI
+# ==================================================
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
-    """Memanggil Gemini API menggunakan SDK resmi google-genai"""
-    clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
-    if not clean_key:
-        raise Exception("GEMINI_API_KEY belum terpasang di Variables Railway.")
-
-    # Inisialisasi client resmi dari Google
-    client = genai.Client(api_key=clean_key)
-    
-    system_instruction = (
-        "You are an expert web developer. Create a complete, single-file modern responsive HTML website "
-        "using Tailwind CSS (via CDN: <script src='https://cdn.tailwindcss.com'></script>) and JavaScript based on the user's request. "
-        "IMPORTANT: Output ONLY valid, clean HTML code starting with <!DOCTYPE html> and ending with </html>. "
-        "Do NOT include markdown block markers like ```html or any explanatory prose."
-    )
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY belum diatur di Environment Variables."
+        )
 
     try:
-        # Panggil model gemini-2.5-flash via SDK resmi
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"{system_instruction}\n\nUser Request: {user_prompt}"
-        )
-        
+        # SDK Gemini bersifat sinkron, jadi jalankan di thread
+        # agar bot Telegram tetap responsif.
+        def generate():
+            client = genai.Client(api_key=GEMINI_API_KEY)
+
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.4,
+                    max_output_tokens=16000,
+                ),
+            )
+
+        response = await asyncio.to_thread(generate)
         raw_html = response.text
-        # Bersihkan format markdown jika ada
-        clean_html = raw_html.replace('```html', '').replace('```HTML', '').replace('```', '').strip()
+
+        if not raw_html or not raw_html.strip():
+            raise RuntimeError(
+                "Gemini tidak menghasilkan kode HTML. "
+                "Coba prompt yang lebih jelas."
+            )
+
+        # Membersihkan Markdown fence jika model tetap menghasilkannya.
+        clean_html = raw_html.strip()
+        clean_html = re.sub(
+            r"^```(?:html)?\s*",
+            "",
+            clean_html,
+            flags=re.IGNORECASE,
+        )
+        clean_html = re.sub(
+            r"\s*```$",
+            "",
+            clean_html,
+        ).strip()
+
+        # Pastikan respons terlihat seperti dokumen HTML.
+        if "<html" not in clean_html.lower():
+            raise RuntimeError(
+                "Hasil Gemini bukan dokumen HTML lengkap."
+            )
+
+        if "</html>" not in clean_html.lower():
+            raise RuntimeError(
+                "Kode HTML terpotong atau tidak memiliki penutup </html>. "
+                "Coba prompt yang lebih sederhana."
+            )
+
         return clean_html
 
-    except Exception as e:
-        raise Exception(f"Gagal memanggil Gemini SDK: {str(e)}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gagal menghasilkan HTML dengan Gemini: {exc}"
+        ) from exc
 
-async def create_github_repo(repo_name: str):
-    clean_token = GITHUB_TOKEN.strip() if GITHUB_TOKEN else ""
-    url = "https://api.github.com/user/repos"
-    headers = {
-        "Authorization": f"token {clean_token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    payload = {
-        "name": repo_name,
-        "private": False,
-        "auto_init": False
-    }
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    if response.status_code in [201, 422]:
-        return f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
-    else:
-        raise Exception(f"Gagal membuat repo GitHub: {response.json().get('message')}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_prompt = update.message.text
-    chat_id = update.message.chat.id
+# ==================================================
+# GITHUB
+# ==================================================
+
+def github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def create_github_repo(repo_name: str) -> str:
+    def create():
+        response = requests.post(
+            f"{GITHUB_API_URL}/user/repos",
+            headers=github_headers(),
+            json={
+                "name": repo_name,
+                "private": False,
+                "auto_init": False,
+                "description": "Website generated by Telegram AI Bot",
+            },
+            timeout=30,
+        )
+
+        if response.status_code == 201:
+            data = response.json()
+            return data["html_url"]
+
+        # Jangan menganggap semua HTTP 422 sebagai sukses.
+        # 422 juga bisa berarti nama repository bermasalah.
+        if response.status_code == 422:
+            check = requests.get(
+                f"{GITHUB_API_URL}/repos/"
+                f"{quote(GITHUB_USERNAME, safe='')}/"
+                f"{quote(repo_name, safe='')}",
+                headers=github_headers(),
+                timeout=30,
+            )
+
+            if check.status_code == 200:
+                return check.json()["html_url"]
+
+        try:
+            message = response.json().get(
+                "message", response.text
+            )
+        except ValueError:
+            message = response.text
+
+        raise RuntimeError(
+            f"GitHub gagal membuat repository "
+            f"(HTTP {response.status_code}): {message}"
+        )
+
+    return await asyncio.to_thread(create)
+
+
+async def push_to_github(work_dir: Path, repo_name: str):
+    # Autentikasi Git melalui header, bukan token di URL remote.
+    # Dengan begitu token tidak tertulis di konfigurasi origin.
+    repo_url = (
+        f"https://github.com/"
+        f"{quote(GITHUB_USERNAME, safe='')}/"
+        f"{quote(repo_name, safe='')}.git"
+    )
+
+    def run_git(args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(work_dir),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def push():
+        run_git(["init"])
+        run_git(["config", "user.name", "AI Bot"])
+        run_git(["config", "user.email", "bot@ai.local"])
+        run_git(["add", "index.html"])
+
+        run_git([
+            "commit",
+            "-m",
+            "Generate website with Gemini AI",
+        ])
+
+        run_git(["branch", "-M", "main"])
+
+        # Mendukung pengulangan proses pada workspace yang sama.
+        remote = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(work_dir),
+            capture_output=True,
+            text=True,
+        )
+
+        if remote.returncode == 0:
+            run_git(["remote", "set-url", "origin", repo_url])
+        else:
+            run_git(["remote", "add", "origin", repo_url])
+
+        encoded_token = quote(GITHUB_TOKEN, safe="")
+        auth_value = f"x-access-token:{encoded_token}"
+
+        # GitHub menerima autentikasi HTTPS melalui HTTP extra header.
+        # Jangan mencetak header ini ke log karena berisi token.
+        run_git([
+            "-c",
+            f"http.https://github.com/.extraheader="
+            f"AUTHORIZATION: basic "
+            f"{__import__('base64').b64encode(auth_value.encode()).decode()}",
+            "push",
+            "-u",
+            "origin",
+            "main",
+        ])
+
+    await asyncio.to_thread(push)
+
+
+# ==================================================
+# PERINTAH TELEGRAM
+# ==================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message:
+        await update.message.reply_text(
+            "Halo! Kirim deskripsi website yang ingin kamu buat.\n\n"
+            "Contoh:\n"
+            "Buat website toko kopi modern dengan katalog produk, "
+            "keranjang sederhana, dan desain responsif.\n\n"
+            "Bot akan membuat index.html menggunakan Gemini "
+            "dan mengunggahnya ke GitHub."
+        )
+
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.message.text:
+        return
+
+    user_prompt = update.message.text.strip()
+    chat_id = update.effective_chat.id
     message_id = update.message.message_id
-    
-    status_msg = await update.message.reply_text("⏳ [1/3] Menyiapkan workspace...")
 
-    work_dir = os.path.abspath(f"./workspace_{chat_id}_{message_id}")
-    os.makedirs(work_dir, exist_ok=True)
+    if len(user_prompt) < 5:
+        await update.message.reply_text(
+            "Prompt terlalu singkat. Jelaskan website yang ingin dibuat."
+        )
+        return
 
+    status_msg = await update.message.reply_text(
+        "⏳ [1/3] Menyiapkan workspace..."
+    )
+
+    work_dir = WORKSPACE_DIR / f"{chat_id}_{message_id}"
     repo_name = f"web-ai-{chat_id}-{message_id}"
 
     try:
-        await status_msg.edit_text("🤖 [2/3] Gemini AI sedang merancang & menulis kode HTML...")
-
-        # 1. Panggil Gemini SDK
-        html_code = await generate_html_with_gemini(user_prompt)
-
-        # 2. Simpan ke index.html
-        index_path = os.path.join(work_dir, "index.html")
-        with open(index_path, "w", encoding="utf-8") as f:
-            f.write(html_code)
-
-        await status_msg.edit_text("🐙 [3/3] Membuat repository & mengunggah ke GitHub...")
-
-        # 3. Buat Repo di GitHub & Push
-        repo_url = await create_github_repo(repo_name)
-        clean_token = GITHUB_TOKEN.strip() if GITHUB_TOKEN else ""
-        auth_repo_url = f"https://{GITHUB_USERNAME}:{clean_token}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
-        
-        commands = [
-            ["git", "init"],
-            ["git", "config", "user.name", "AI Bot"],
-            ["git", "config", "user.email", "bot@ai.local"],
-            ["git", "add", "."],
-            ["git", "commit", "-m", f"Generated website for prompt: {user_prompt[:50]}"],
-            ["git", "branch", "-M", "main"],
-            ["git", "remote", "add", "origin", auth_repo_url],
-            ["git", "push", "-u", "origin", "main"]
-        ]
-
-        for cmd in commands:
-            subprocess.run(cmd, cwd=work_dir, check=True, capture_output=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
 
         await status_msg.edit_text(
-            f"✅ **Website Berhasil Dibuat & Diunggah ke GitHub!**\n\n"
-            f"📦 **Repository GitHub Kamu:**\n{repo_url}\n\n"
-            f"💡 *Kamu bisa melihat file index.html di dalam repository tersebut.*",
-            parse_mode="Markdown"
+            "🤖 [2/3] Gemini sedang membuat website..."
         )
 
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Terjadi kesalahan: {str(e)}")
+        html_code = await generate_html_with_gemini(user_prompt)
+
+        index_path = work_dir / "index.html"
+        index_path.write_text(html_code, encoding="utf-8")
+
+        await status_msg.edit_text(
+            "🐙 [3/3] Menyiapkan repository dan mengunggah ke GitHub..."
+        )
+
+        repo_url = await create_github_repo(repo_name)
+        await push_to_github(work_dir, repo_name)
+
+        await status_msg.edit_text(
+            "✅ Website berhasil dibuat dan diunggah!\n\n"
+            f"📦 Repository:\n{repo_url}\n\n"
+            "📄 File website: index.html\n\n"
+            "Catatan: repository sudah berisi kode HTML. "
+            "Untuk menampilkan website secara publik, "
+            "aktifkan GitHub Pages jika diperlukan."
+        )
+
+    except subprocess.CalledProcessError as exc:
+        # Output Git dapat berisi detail teknis. Jangan kirim
+        # environment variable atau kredensial ke pengguna.
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        detail = detail[-1200:]
+
+        await status_msg.edit_text(
+            "❌ Proses Git gagal.\n\n"
+            f"Detail:\n{detail}"
+        )
+
+    except Exception as exc:
+        await status_msg.edit_text(
+            f"❌ Terjadi kesalahan:\n{str(exc)[:2500]}"
+        )
+
+
+# ==================================================
+# MENJALANKAN BOT
+# ==================================================
+
+def main():
+    validate_config()
+
+    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        )
+    )
+
+    print(f"Bot aktif. Model Gemini: {GEMINI_MODEL}")
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    main()
