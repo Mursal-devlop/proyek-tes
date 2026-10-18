@@ -8,18 +8,28 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RAW_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+
+def get_clean_api_key(raw_key: str) -> str:
+    """Ekstrak kunci API murni jika ada format URL / Markdown yang terselip"""
+    if not raw_key:
+        return ""
+    # Jika terlanjur berisi URL/Markdown, ambil bagian paling akhir dari kunci
+    if "key=" in raw_key:
+        raw_key = raw_key.split("key=")[-1]
+    # Buang semua karakter markdown/kurung/spasi
+    clean = re.sub(r'[\[\]\(\)\'\"\r\n\t\s]', '', raw_key)
+    # Jika ada sisa URL, ambil teks alfanumerik + strip/underscore kuncinya saja
+    match = re.search(r'[A-Za-z0-9_\-]+$', clean)
+    return match.group(0) if match else clean
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
-    """Memanggil Google Gemini API dengan sanitasi URL murni"""
-    # Ambil kunci API dan bersihkan dari spasi/karakter tersembunyi
-    raw_key = GEMINI_API_KEY if GEMINI_API_KEY else ""
-    clean_key = re.sub(r'[\r\n\t\s]', '', raw_key)
+    clean_key = get_clean_api_key(RAW_GEMINI_KEY)
     
     if not clean_key:
-        raise Exception("GEMINI_API_KEY belum terpasang di Variables Railway.")
+        raise Exception("GEMINI_API_KEY kosong atau tidak valid di Railway Variables.")
 
-    # Endpoint Gemini 2.0 Flash
+    # Panggil Gemini API dengan URL murni
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
     headers = {"Content-Type": "application/json"}
     
@@ -41,7 +51,7 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
     
     response = requests.post(url, headers=headers, json=payload, timeout=60)
 
-    # Fallback ke gemini-1.5-flash jika gemini-2.0-flash tidak merespons
+    # Fallback ke gemini-1.5-flash jika gemini-2.0-flash bermasalah
     if response.status_code == 404:
         url_fallback = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){clean_key}"
         response = requests.post(url_fallback, headers=headers, json=payload, timeout=60)
@@ -50,19 +60,16 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
         data = response.json()
         raw_html = data['candidates'][0]['content']['parts'][0]['text']
         
-        # Bersihkan pembungkus markdown ```html
         clean_html = re.sub(r'```html\s*', '', raw_html, flags=re.IGNORECASE)
         clean_html = re.sub(r'```\s*$', '', clean_html).strip()
         return clean_html
     else:
-        # Sembunyikan API key jika ada error agar tidak bocor di chat log
         err_msg = response.text.replace(clean_key, "HIDDEN_KEY")
         raise Exception(f"Gemini API Error ({response.status_code}): {err_msg}")
 
 async def create_github_repo(repo_name: str):
-    """Membuat Repository publik baru di GitHub"""
-    clean_token = re.sub(r'[\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
-    url = "https://api.github.com/user/repos"
+    clean_token = re.sub(r'[\[\]\(\)\'\"\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
+    url = "[https://api.github.com/user/repos](https://api.github.com/user/repos)"
     headers = {
         "Authorization": f"token {clean_token}",
         "Accept": "application/vnd.github.v3+json"
@@ -74,7 +81,7 @@ async def create_github_repo(repo_name: str):
     }
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     if response.status_code in [201, 422]:
-        return f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
+        return f"[https://github.com/](https://github.com/){GITHUB_USERNAME}/{repo_name}"
     else:
         raise Exception(f"Gagal membuat repo GitHub: {response.json().get('message')}")
 
@@ -105,8 +112,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3. Buat Repo di GitHub & Push
         repo_url = await create_github_repo(repo_name)
-        clean_token = re.sub(r'[\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
-        auth_repo_url = f"https://{GITHUB_USERNAME}:{clean_token}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
+        clean_token = re.sub(r'[\[\]\(\)\'\"\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
+        auth_repo_url = f"https://{GITHUB_USERNAME}:{clean_token}@[github.com/](https://github.com/){GITHUB_USERNAME}/{repo_name}.git"
         
         commands = [
             ["git", "init"],
