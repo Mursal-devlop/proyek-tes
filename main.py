@@ -5,15 +5,15 @@ import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Mengambil variabel lingkungan dari Railway
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
-    """Memanggil Google Gemini API langsung untuk membuat kode HTML tanpa CLI/OpenCode"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    """Memanggil Google Gemini API menggunakan endpoint model terbaru"""
+    # Menggunakan model gemini-2.5-flash / gemini-2.0-flash terbaru
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
     system_instruction = (
@@ -33,11 +33,17 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
     }
     
     response = requests.post(url, headers=headers, json=payload, timeout=60)
+    
+    # Fallback ke gemini-2.0-flash jika gemini-2.5-flash belum tersedia di region tertentu
+    if response.status_code == 404:
+        url_fallback = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=){GEMINI_API_KEY}"
+        response = requests.post(url_fallback, headers=headers, json=payload, timeout=60)
+
     if response.status_code == 200:
         data = response.json()
         raw_html = data['candidates'][0]['content']['parts'][0]['text']
         
-        # Bersihkan jika Gemini menyertakan pemformatan markdown ```html
+        # Bersihkan format markdown ```html
         clean_html = re.sub(r'```html\s*', '', raw_html, flags=re.IGNORECASE)
         clean_html = re.sub(r'```\s*$', '', clean_html).strip()
         return clean_html
@@ -57,7 +63,7 @@ async def create_github_repo(repo_name: str):
         "auto_init": False
     }
     response = requests.post(url, headers=headers, json=payload, timeout=30)
-    if response.status_code in [201, 422]:  # 201 Created, 422 jika nama repo sudah ada
+    if response.status_code in [201, 422]:
         return f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
     else:
         raise Exception(f"Gagal membuat repo GitHub: {response.json().get('message')}")
@@ -108,7 +114,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"✅ **Website Berhasil Dibuat & Diunggah ke GitHub!**\n\n"
             f"📦 **Repository GitHub Kamu:**\n{repo_url}\n\n"
-            f"💡 *Kamu bisa melihat file index.html atau mengaktifkan GitHub Pages di tab Settings repository tersebut.*",
+            f"💡 *Kamu bisa melihat file index.html di GitHub tersebut.*",
             parse_mode="Markdown"
         )
 
