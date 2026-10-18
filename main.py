@@ -1,85 +1,100 @@
 import os
 import subprocess
-import re
 import glob
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-NETLIFY_AUTH_TOKEN = os.getenv("NETLIFY_AUTH_TOKEN")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")  # Masukkan username GitHub kamu di environment variable
+
+async def create_github_repo(repo_name: str):
+    """Fungsi untuk membuat Repository baru di GitHub via API"""
+    url = "https://api.github.com/user/repos"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    payload = {
+        "name": repo_name,
+        "private": False,  # Ubah ke True jika ingin repository otomatis bernilai Private
+        "auto_init": False
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_status_code in [201, 422]:  # 201 Created, 422 jika repo sudah ada
+        return f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
+    else:
+        raise Exception(f"Gagal membuat repo GitHub: {response.json().get('message')}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_prompt = update.message.text
     chat_id = update.message.chat.id
+    message_id = update.message.message_id
     
     status_msg = await update.message.reply_text("⏳ [1/3] Menyiapkan workspace...")
 
-    work_dir = os.path.abspath(f"./workspace_{chat_id}")
+    work_dir = os.path.abspath(f"./workspace_{chat_id}_{message_id}")
     os.makedirs(work_dir, exist_ok=True)
+
+    # Nama repository otomatis berdasarkan ID pesan
+    repo_name = f"web-ai-{chat_id}-{message_id}"
 
     try:
         enhanced_prompt = (
             f"Build a complete, single-page responsive website based on this request: '{user_prompt}'. "
             f"Use HTML, Tailwind CSS via CDN (<script src='https://cdn.tailwindcss.com'></script>), and JavaScript. "
-            f"IMPORTANT: Save the main file directly as 'index.html' in the working directory."
+            f"IMPORTANT: Save the primary file directly as 'index.html' in the working directory."
         )
 
-        await status_msg.edit_text("🤖 [2/3] OpenCode sedang memproses kode...")
+        await status_msg.edit_text("🤖 [2/3] OpenCode AI sedang merancang & menulis kode...")
 
-        # Jalankan OpenCode dan tangkap log jika terjadi error
-        process = subprocess.run(
-            ["opencode", enhanced_prompt],
-            cwd=work_dir,
-            capture_output=True,
-            text=True
-        )
+        # 1. Jalankan OpenCode CLI
+        subprocess.run(["opencode", enhanced_prompt], cwd=work_dir, check=True)
 
-        # Cek apakah ada file .html yang berhasil dibuat oleh OpenCode
+        # Cek apakah file HTML berhasil dibuat
         html_files = glob.glob(f"{work_dir}/**/*.html", recursive=True)
-
         if not html_files:
-            # Jika tidak ada file HTML, tampilkan isi folder dan log error
-            all_files = os.listdir(work_dir)
-            error_log = process.stderr[:300] if process.stderr else "Tidak ada log error terminal."
-            await status_msg.edit_text(
-                f"❌ **OpenCode gagal membuat file HTML.**\n\n"
-                f"📂 Isi folder workspace: `{all_files}`\n"
-                f"⚠️ Error Log: `{error_log}`\n\n"
-                f"💡 *Pastikan GEMINI_API_KEY sudah dimasukkan di Variables Railway.*",
-                parse_mode="Markdown"
-            )
+            await status_msg.edit_text("❌ OpenCode selesai bekerja tetapi tidak ditemukan file .html!")
             return
 
-        # Pastikan file HTML utama bernama index.html di direktori deploy
+        # Pastikan ada file index.html di root
         target_html = html_files[0]
-        deploy_dir = os.path.dirname(target_html)
-        index_path = os.path.join(deploy_dir, "index.html")
-
+        index_path = os.path.join(work_dir, "index.html")
         if target_html != index_path:
             os.rename(target_html, index_path)
 
-        await status_msg.edit_text("🚀 [3/3] Mengunggah file ke Netlify...")
+        await status_msg.edit_text("🐙 [3/3] Membuat repository & mengunggah ke GitHub...")
 
-        # Deploy hanya direktori yang dipastikan berisi index.html
-        cmd_deploy = f"npx netlify-cli deploy --dir={deploy_dir} --prod --auth={NETLIFY_AUTH_TOKEN}"
-        result = subprocess.run(cmd_deploy, shell=True, capture_output=True, text=True)
+        # 2. Buat Repo di GitHub via API
+        repo_url = await create_github_repo(repo_name)
 
-        # Ambil link live Netlify dari output
-        url_match = re.search(r'https://[a-zA-Z0-9-]+\.netlify\.app', result.stdout)
+        # 3. Inisialisasi Git lokal & Push ke Remote Repo
+        auth_repo_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
         
-        if url_match:
-            site_url = url_match.group(0)
-            await status_msg.edit_text(
-                f"✅ **Website Kamu Berhasil Aktif!**\n\n"
-                f"🔗 Link Website:\n{site_url}",
-                parse_mode="Markdown"
-            )
-        else:
-            await status_msg.edit_text(
-                f"⚠️ **Netlify Deploy Log:**\n```\n{result.stdout[-400:]}\n```",
-                parse_mode="Markdown"
-            )
+        commands = [
+            ["git", "init"],
+            ["git", "config", "user.name", "AI Bot"],
+            ["git", "config", "user.email", "bot@ai.local"],
+            ["git", "add", "."],
+            ["git", "commit", "-m", f"Initial commit generated by AI for prompt: {user_prompt[:50]}"],
+            ["git", "branch", "-M", "main"],
+            ["git", "remote", "add", "origin", auth_repo_url],
+            ["git", "push", "-u", "origin", "main"]
+        ]
 
+        for cmd in commands:
+            subprocess.run(cmd, cwd=work_dir, check=True, capture_output=True)
+
+        await status_msg.edit_text(
+            f"✅ **Website Berhasil Dibuat & Diunggah ke GitHub!**\n\n"
+            f"📦 **Repository GitHub Kamu:**\n{repo_url}\n\n"
+            f"💡 *Kamu bisa melihat/mengedit kodenya di GitHub, atau mengaktifkan GitHub Pages jika ingin langsung live.*",
+            parse_mode="Markdown"
+        )
+
+    except subprocess.CalledProcessError as e:
+        await status_msg.edit_text(f"❌ Gagal pada proses Git/OpenCode. Error: {e}")
     except Exception as e:
         await status_msg.edit_text(f"❌ Terjadi kesalahan: {str(e)}")
 
