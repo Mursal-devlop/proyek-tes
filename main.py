@@ -1,37 +1,23 @@
 import os
 import subprocess
-import re
 import requests
+from google import genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
-RAW_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-
-def get_clean_api_key(raw_key: str) -> str:
-    """Ekstrak kunci API murni jika ada format URL / Markdown yang terselip"""
-    if not raw_key:
-        return ""
-    # Jika terlanjur berisi URL/Markdown, ambil bagian paling akhir dari kunci
-    if "key=" in raw_key:
-        raw_key = raw_key.split("key=")[-1]
-    # Buang semua karakter markdown/kurung/spasi
-    clean = re.sub(r'[\[\]\(\)\'\"\r\n\t\s]', '', raw_key)
-    # Jika ada sisa URL, ambil teks alfanumerik + strip/underscore kuncinya saja
-    match = re.search(r'[A-Za-z0-9_\-]+$', clean)
-    return match.group(0) if match else clean
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
-    clean_key = get_clean_api_key(RAW_GEMINI_KEY)
-    
+    """Memanggil Gemini API menggunakan SDK resmi google-genai"""
+    clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
     if not clean_key:
-        raise Exception("GEMINI_API_KEY kosong atau tidak valid di Railway Variables.")
+        raise Exception("GEMINI_API_KEY belum terpasang di Variables Railway.")
 
-    # Panggil Gemini API dengan URL murni
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
-    headers = {"Content-Type": "application/json"}
+    # Inisialisasi client resmi dari Google
+    client = genai.Client(api_key=clean_key)
     
     system_instruction = (
         "You are an expert web developer. Create a complete, single-file modern responsive HTML website "
@@ -39,37 +25,25 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
         "IMPORTANT: Output ONLY valid, clean HTML code starting with <!DOCTYPE html> and ending with </html>. "
         "Do NOT include markdown block markers like ```html or any explanatory prose."
     )
-    
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": f"{system_instruction}\n\nUser Request: {user_prompt}"}]
-            }
-        ]
-    }
-    
-    response = requests.post(url, headers=headers, json=payload, timeout=60)
 
-    # Fallback ke gemini-1.5-flash jika gemini-2.0-flash bermasalah
-    if response.status_code == 404:
-        url_fallback = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){clean_key}"
-        response = requests.post(url_fallback, headers=headers, json=payload, timeout=60)
-
-    if response.status_code == 200:
-        data = response.json()
-        raw_html = data['candidates'][0]['content']['parts'][0]['text']
+    try:
+        # Panggil model gemini-2.5-flash via SDK resmi
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=f"{system_instruction}\n\nUser Request: {user_prompt}"
+        )
         
-        clean_html = re.sub(r'```html\s*', '', raw_html, flags=re.IGNORECASE)
-        clean_html = re.sub(r'```\s*$', '', clean_html).strip()
+        raw_html = response.text
+        # Bersihkan format markdown jika ada
+        clean_html = raw_html.replace('```html', '').replace('```HTML', '').replace('```', '').strip()
         return clean_html
-    else:
-        err_msg = response.text.replace(clean_key, "HIDDEN_KEY")
-        raise Exception(f"Gemini API Error ({response.status_code}): {err_msg}")
+
+    except Exception as e:
+        raise Exception(f"Gagal memanggil Gemini SDK: {str(e)}")
 
 async def create_github_repo(repo_name: str):
-    clean_token = re.sub(r'[\[\]\(\)\'\"\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
-    url = "[https://api.github.com/user/repos](https://api.github.com/user/repos)"
+    clean_token = GITHUB_TOKEN.strip() if GITHUB_TOKEN else ""
+    url = "https://api.github.com/user/repos"
     headers = {
         "Authorization": f"token {clean_token}",
         "Accept": "application/vnd.github.v3+json"
@@ -81,7 +55,7 @@ async def create_github_repo(repo_name: str):
     }
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     if response.status_code in [201, 422]:
-        return f"[https://github.com/](https://github.com/){GITHUB_USERNAME}/{repo_name}"
+        return f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
     else:
         raise Exception(f"Gagal membuat repo GitHub: {response.json().get('message')}")
 
@@ -100,7 +74,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await status_msg.edit_text("🤖 [2/3] Gemini AI sedang merancang & menulis kode HTML...")
 
-        # 1. Panggil Gemini API
+        # 1. Panggil Gemini SDK
         html_code = await generate_html_with_gemini(user_prompt)
 
         # 2. Simpan ke index.html
@@ -112,8 +86,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3. Buat Repo di GitHub & Push
         repo_url = await create_github_repo(repo_name)
-        clean_token = re.sub(r'[\[\]\(\)\'\"\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
-        auth_repo_url = f"https://{GITHUB_USERNAME}:{clean_token}@[github.com/](https://github.com/){GITHUB_USERNAME}/{repo_name}.git"
+        clean_token = GITHUB_TOKEN.strip() if GITHUB_TOKEN else ""
+        auth_repo_url = f"https://{GITHUB_USERNAME}:{clean_token}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
         
         commands = [
             ["git", "init"],
