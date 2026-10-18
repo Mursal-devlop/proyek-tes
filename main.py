@@ -1,6 +1,8 @@
 
 import os
 import re
+import base64
+import shutil
 import asyncio
 import subprocess
 from pathlib import Path
@@ -10,6 +12,7 @@ import requests
 from google import genai
 from google.genai import types
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,8 +30,8 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Model baru berdasarkan pesan error yang kamu terima.
-GEMINI_MODEL = "gemini-3.8-flash"
+# Model dapat diganti lewat Environment Variable.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -93,6 +96,20 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
         def generate():
             client = genai.Client(api_key=GEMINI_API_KEY)
 
+            # API Gemini terbaru menyarankan Interactions API.
+            # Jika SDK lama, fallback ke generate_content.
+            if hasattr(client, "interactions"):
+                return client.interactions.create(
+                    model=GEMINI_MODEL,
+                    input=user_prompt,
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    generation_config={
+                        "temperature": 0.4,
+                        "max_output_tokens": 16000,
+                    },
+                    store=False,
+                )
+
             return client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=user_prompt,
@@ -104,12 +121,19 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
             )
 
         response = await asyncio.to_thread(generate)
-        raw_html = response.text
+
+        raw_html = getattr(response, "output_text", None)
+        if raw_html is None:
+            raw_html = getattr(response, "text", None)
 
         if not raw_html or not raw_html.strip():
+            status = getattr(response, "status", "")
+            errors = getattr(response, "errors", None)
             raise RuntimeError(
-                "Gemini tidak menghasilkan kode HTML. "
-                "Coba prompt yang lebih jelas."
+                "Gemini tidak menghasilkan kode HTML"
+                + (f" (status: {status})" if status else "")
+                + (f" ({errors})" if errors else "")
+                + ". Coba prompt yang lebih jelas."
             )
 
         # Membersihkan Markdown fence jika model tetap menghasilkannya.
@@ -126,17 +150,31 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
             clean_html,
         ).strip()
 
-        # Pastikan respons terlihat seperti dokumen HTML.
-        if "<html" not in clean_html.lower():
+        # Ambil hanya dokumen HTML-nya, buang teks tambahan di luar tag.
+        lower_html = clean_html.lower()
+        start = lower_html.find("<!doctype")
+        if start == -1:
+            start = lower_html.find("<html")
+        end = lower_html.rfind("</html>")
+
+        if start == -1:
             raise RuntimeError(
                 "Hasil Gemini bukan dokumen HTML lengkap."
             )
 
-        if "</html>" not in clean_html.lower():
+        if end == -1:
             raise RuntimeError(
                 "Kode HTML terpotong atau tidak memiliki penutup </html>. "
                 "Coba prompt yang lebih sederhana."
             )
+
+        if end < start:
+            raise RuntimeError(
+                "Struktur HTML dari Gemini tidak valid. "
+                "Coba prompt yang lebih sederhana."
+            )
+
+        clean_html = clean_html[start:end + len("</html>")].strip()
 
         return clean_html
 
@@ -206,6 +244,12 @@ async def create_github_repo(repo_name: str) -> str:
 
 
 async def push_to_github(work_dir: Path, repo_name: str):
+    if shutil.which("git") is None:
+        raise RuntimeError(
+            "Git tidak ditemukan. Pastikan git sudah terpasang "
+            "di server/container."
+        )
+
     # Autentikasi Git melalui header, bukan token di URL remote.
     # Dengan begitu token tidak tertulis di konfigurasi origin.
     repo_url = (
@@ -232,6 +276,7 @@ async def push_to_github(work_dir: Path, repo_name: str):
 
         run_git([
             "commit",
+            "--allow-empty",
             "-m",
             "Generate website with Gemini AI",
         ])
@@ -251,16 +296,17 @@ async def push_to_github(work_dir: Path, repo_name: str):
         else:
             run_git(["remote", "add", "origin", repo_url])
 
-        encoded_token = quote(GITHUB_TOKEN, safe="")
-        auth_value = f"x-access-token:{encoded_token}"
+        auth_value = f"x-access-token:{GITHUB_TOKEN}"
+        basic_auth = base64.b64encode(
+            auth_value.encode("utf-8")
+        ).decode("ascii")
 
         # GitHub menerima autentikasi HTTPS melalui HTTP extra header.
         # Jangan mencetak header ini ke log karena berisi token.
         run_git([
             "-c",
             f"http.https://github.com/.extraheader="
-            f"AUTHORIZATION: basic "
-            f"{__import__('base64').b64encode(auth_value.encode()).decode()}",
+            f"AUTHORIZATION: basic {basic_auth}",
             "push",
             "-u",
             "origin",
@@ -287,6 +333,30 @@ async def start_command(
             "Bot akan membuat index.html menggunakan Gemini "
             "dan mengunggahnya ke GitHub."
         )
+
+
+def redact_secrets(text: str) -> str:
+    """Hapus token/kredensial dari teks sebelum dikirim ke pengguna."""
+    if not text:
+        return ""
+
+    for secret in (GITHUB_TOKEN, GEMINI_API_KEY, TELEGRAM_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+
+    text = re.sub(
+        r"(AUTHORIZATION:\s*basic\s+)\S+",
+        r"\1***",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"https://[^@\s]+@github\.com",
+        "https://***@github.com",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
 
 
 async def handle_message(
@@ -345,7 +415,7 @@ async def handle_message(
         # Output Git dapat berisi detail teknis. Jangan kirim
         # environment variable atau kredensial ke pengguna.
         detail = (exc.stderr or exc.stdout or str(exc)).strip()
-        detail = detail[-1200:]
+        detail = redact_secrets(detail)[-1200:]
 
         await status_msg.edit_text(
             "❌ Proses Git gagal.\n\n"
@@ -353,9 +423,15 @@ async def handle_message(
         )
 
     except Exception as exc:
-        await status_msg.edit_text(
-            f"❌ Terjadi kesalahan:\n{str(exc)[:2500]}"
-        )
+        detail = redact_secrets(str(exc))[:2500]
+        try:
+            await status_msg.edit_text(
+                f"❌ Terjadi kesalahan:\n{detail}"
+            )
+        except TelegramError:
+            await update.message.reply_text(
+                f"❌ Terjadi kesalahan:\n{detail}"
+            )
 
 
 # ==================================================
