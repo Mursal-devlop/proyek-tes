@@ -11,11 +11,15 @@ GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
-    """Memanggil Google Gemini API dengan URL bersih tanpa string/format error"""
-    # Pastikan API Key bersih dari spasi atau karakter tak terlihat
-    clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
+    """Memanggil Google Gemini API dengan sanitasi URL murni"""
+    # Ambil kunci API dan bersihkan dari spasi/karakter tersembunyi
+    raw_key = GEMINI_API_KEY if GEMINI_API_KEY else ""
+    clean_key = re.sub(r'[\r\n\t\s]', '', raw_key)
     
-    # URL murni
+    if not clean_key:
+        raise Exception("GEMINI_API_KEY belum terpasang di Variables Railway.")
+
+    # Endpoint Gemini 2.0 Flash
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
     headers = {"Content-Type": "application/json"}
     
@@ -37,7 +41,7 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
     
     response = requests.post(url, headers=headers, json=payload, timeout=60)
 
-    # Jika gemini-2.0-flash tidak ditemukan, fallback ke gemini-1.5-flash
+    # Fallback ke gemini-1.5-flash jika gemini-2.0-flash tidak merespons
     if response.status_code == 404:
         url_fallback = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){clean_key}"
         response = requests.post(url_fallback, headers=headers, json=payload, timeout=60)
@@ -46,20 +50,21 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
         data = response.json()
         raw_html = data['candidates'][0]['content']['parts'][0]['text']
         
-        # Bersihkan jika ada pembungkus markdown ```html
+        # Bersihkan pembungkus markdown ```html
         clean_html = re.sub(r'```html\s*', '', raw_html, flags=re.IGNORECASE)
         clean_html = re.sub(r'```\s*$', '', clean_html).strip()
         return clean_html
     else:
-        # Sembunyikan API key jika ada error agar log aman
+        # Sembunyikan API key jika ada error agar tidak bocor di chat log
         err_msg = response.text.replace(clean_key, "HIDDEN_KEY")
         raise Exception(f"Gemini API Error ({response.status_code}): {err_msg}")
 
 async def create_github_repo(repo_name: str):
     """Membuat Repository publik baru di GitHub"""
+    clean_token = re.sub(r'[\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
     url = "https://api.github.com/user/repos"
     headers = {
-        "Authorization": f"token {GITHUB_TOKEN.strip() if GITHUB_TOKEN else ''}",
+        "Authorization": f"token {clean_token}",
         "Accept": "application/vnd.github.v3+json"
     }
     payload = {
@@ -100,7 +105,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3. Buat Repo di GitHub & Push
         repo_url = await create_github_repo(repo_name)
-        auth_repo_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN.strip()}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
+        clean_token = re.sub(r'[\r\n\t\s]', '', GITHUB_TOKEN) if GITHUB_TOKEN else ""
+        auth_repo_url = f"https://{GITHUB_USERNAME}:{clean_token}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
         
         commands = [
             ["git", "init"],
@@ -119,7 +125,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"✅ **Website Berhasil Dibuat & Diunggah ke GitHub!**\n\n"
             f"📦 **Repository GitHub Kamu:**\n{repo_url}\n\n"
-            f"💡 *Kamu bisa melihat file index.html di dalamnya.*",
+            f"💡 *Kamu bisa melihat file index.html di dalam repository tersebut.*",
             parse_mode="Markdown"
         )
 
