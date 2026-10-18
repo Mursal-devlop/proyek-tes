@@ -1,6 +1,7 @@
 import os
 import subprocess
 import glob
+import re
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -39,44 +40,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repo_name = f"web-ai-{chat_id}-{message_id}"
 
     try:
-        # Buat instruksi ringkas agar OpenCode paham
-        enhanced_prompt = (
-            f"Build a complete, single-page responsive website based on this request: {user_prompt}. "
-            f"Use HTML, Tailwind CSS via CDN, and JavaScript. "
-            f"Save the primary file directly as index.html in the working directory."
+        clean_prompt = user_prompt.replace('"', '').replace("'", "")
+        prompt = (
+            f"Generate a single-file responsive website HTML page using Tailwind CSS for: {clean_prompt}. "
+            f"Output ONLY valid HTML code including <!DOCTYPE html>."
         )
 
         await status_msg.edit_text("🤖 [2/3] OpenCode AI sedang merancang & menulis kode...")
 
-        # FIX: Panggil opencode dengan flag -p atau prompt argument yang tepat
-        # Jika opencode milikmu memakai 'opencode prompt', jalankan via shell yang sudah diclean
+        # 1. Jalankan OpenCode dan tangkap output teksnya
         process = subprocess.run(
-            ["opencode", "-p", enhanced_prompt], 
+            f'opencode "{prompt}"', 
+            shell=True, 
             cwd=work_dir, 
             capture_output=True, 
             text=True
         )
 
-        # Jika opsi flag -p gagal, coba tanpa flag tetapi dipisah dengan benar
-        if process.returncode != 0:
-            clean_prompt = user_prompt.replace('"', '').replace("'", "")
-            process = subprocess.run(
-                f'opencode "Create a single page website for: {clean_prompt}"', 
-                shell=True, 
-                cwd=work_dir, 
-                capture_output=True, 
-                text=True
-            )
-
-        # Cek apakah file HTML berhasil dibuat
+        # 2. Cek apakah ada file .html yang langsung terbuat di workspace
         html_files = glob.glob(f"{work_dir}/**/*.html", recursive=True)
+
+        # Jika OpenCode tidak membuat file, tetapi mengembalikan teks kode HTML di stdout
+        if not html_files and process.stdout:
+            stdout_text = process.stdout
+            # Ekstrak kode HTML dari output (jika dibungkus ```html ... ```)
+            html_match = re.search(r'<!DOCTYPE html>.*</html>', stdout_text, re.DOTALL | re.IGNORECASE)
+            if not html_match:
+                html_match = re.search(r'<html.*</html>', stdout_text, re.DOTALL | re.IGNORECASE)
+
+            if html_match:
+                code_content = html_match.group(0)
+            elif "<head>" in stdout_text or "<body>" in stdout_text:
+                code_content = stdout_text
+            else:
+                code_content = None
+
+            if code_content:
+                # Tulis langsung kode HTML yang ditangkap ke file index.html
+                index_path = os.path.join(work_dir, "index.html")
+                with open(index_path, "w", encoding="utf-8") as f:
+                    f.write(code_content)
+                html_files = [index_path]
+
+        # 3. Jika tetap tidak ada file HTML dan tidak ada output valid
         if not html_files:
             all_files = os.listdir(work_dir)
-            err_log = process.stderr[:300] if process.stderr else process.stdout[:300]
+            log_output = (process.stderr or process.stdout or "Tidak ada output")[:300]
             await status_msg.edit_text(
-                f"❌ **OpenCode gagal membuat file HTML.**\n\n"
+                f"❌ **OpenCode tidak menghasilkan file atau kode HTML.**\n\n"
                 f"📂 Isi folder: `{all_files}`\n"
-                f"⚠️ Error Log: `{err_log}`",
+                f"⚠️ Output/Log Terminal: `{log_output}`\n\n"
+                f"💡 *Pastikan `GEMINI_API_KEY` sudah terpasang di Variables Railway.*",
                 parse_mode="Markdown"
             )
             return
@@ -88,7 +102,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text("🐙 [3/3] Membuat repository & mengunggah ke GitHub...")
 
-        # Buat Repo & Push
+        # 4. Buat Repository di GitHub dan Push
         repo_url = await create_github_repo(repo_name)
         auth_repo_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
         
