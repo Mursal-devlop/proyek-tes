@@ -2,7 +2,6 @@ import os
 import subprocess
 import re
 import glob
-import shutil
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -13,62 +12,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_prompt = update.message.text
     chat_id = update.message.chat.id
     
-    status_msg = await update.message.reply_text("⏳ [1/3] Menyiapkan environment dan prompt...")
+    status_msg = await update.message.reply_text("⏳ [1/3] Menyiapkan workspace...")
 
-    work_dir = f"./workspace_{chat_id}"
+    work_dir = os.path.abspath(f"./workspace_{chat_id}")
     os.makedirs(work_dir, exist_ok=True)
 
     try:
-        # Prompt yang mewajibkan pembuatan index.html di root folder
         enhanced_prompt = (
-            f"You are an expert web developer. Build a complete, responsive, and highly modern website "
-            f"using HTML, Tailwind CSS via CDN (<script src='https://cdn.tailwindcss.com'></script>), and JavaScript "
-            f"based on this request: {user_prompt}. "
-            f"CRITICAL REQUIREMENT: You MUST create a primary file named 'index.html' directly in the working directory. "
-            f"Do not put it inside a subfolder unless necessary, and ensure index.html exists."
+            f"Build a complete, single-page responsive website based on this request: '{user_prompt}'. "
+            f"Use HTML, Tailwind CSS via CDN (<script src='https://cdn.tailwindcss.com'></script>), and JavaScript. "
+            f"IMPORTANT: Save the main file directly as 'index.html' in the working directory."
         )
 
-        await status_msg.edit_text("🤖 [2/3] OpenCode AI sedang merancang & menulis file website...")
+        await status_msg.edit_text("🤖 [2/3] OpenCode sedang memproses kode...")
 
-        # Panggil OpenCode CLI
-        subprocess.run(["opencode", enhanced_prompt], cwd=work_dir, check=True)
+        # Jalankan OpenCode dan tangkap log jika terjadi error
+        process = subprocess.run(
+            ["opencode", enhanced_prompt],
+            cwd=work_dir,
+            capture_output=True,
+            text=True
+        )
 
-        # FIX 404: Cari dan pastikan file index.html tersedia
-        deploy_dir = work_dir
-        index_path = os.path.join(work_dir, "index.html")
+        # Cek apakah ada file .html yang berhasil dibuat oleh OpenCode
+        html_files = glob.glob(f"{work_dir}/**/*.html", recursive=True)
 
-        if not os.path.exists(index_path):
-            # Cari file .html apa saja yang mungkin dibuat OpenCode (termasuk di sub-folder)
-            html_files = glob.glob(f"{work_dir}/**/*.html", recursive=True)
-            if html_files:
-                # Ambil file HTML pertama dan gunakan foldernya sebagai deploy_dir
-                target_html = html_files[0]
-                target_dir = os.path.dirname(target_html)
-                
-                # Ubah nama file menjadi index.html jika namanya beda
-                new_index_path = os.path.join(target_dir, "index.html")
-                if target_html != new_index_path:
-                    os.rename(target_html, new_index_path)
-                
-                deploy_dir = target_dir
+        if not html_files:
+            # Jika tidak ada file HTML, tampilkan isi folder dan log error
+            all_files = os.listdir(work_dir)
+            error_log = process.stderr[:300] if process.stderr else "Tidak ada log error terminal."
+            await status_msg.edit_text(
+                f"❌ **OpenCode gagal membuat file HTML.**\n\n"
+                f"📂 Isi folder workspace: `{all_files}`\n"
+                f"⚠️ Error Log: `{error_log}`\n\n"
+                f"💡 *Pastikan GEMINI_API_KEY sudah dimasukkan di Variables Railway.*",
+                parse_mode="Markdown"
+            )
+            return
 
-        await status_msg.edit_text("🚀 [3/3] Kode selesai dibuat! Sedang mengunggah ke Netlify...")
+        # Pastikan file HTML utama bernama index.html di direktori deploy
+        target_html = html_files[0]
+        deploy_dir = os.path.dirname(target_html)
+        index_path = os.path.join(deploy_dir, "index.html")
 
-        # Deploy folder yang dipastikan berisi index.html
+        if target_html != index_path:
+            os.rename(target_html, index_path)
+
+        await status_msg.edit_text("🚀 [3/3] Mengunggah file ke Netlify...")
+
+        # Deploy hanya direktori yang dipastikan berisi index.html
         cmd_deploy = f"npx netlify-cli deploy --dir={deploy_dir} --prod --auth={NETLIFY_AUTH_TOKEN}"
         result = subprocess.run(cmd_deploy, shell=True, capture_output=True, text=True)
 
-        url_match = re.search(r'https?://[^\s]+\.netlify\.app', result.stdout)
-        site_url = url_match.group(0) if url_match else "Website berhasil di-deploy!"
+        # Ambil link live Netlify dari output
+        url_match = re.search(r'https://[a-zA-Z0-9-]+\.netlify\.app', result.stdout)
+        
+        if url_match:
+            site_url = url_match.group(0)
+            await status_msg.edit_text(
+                f"✅ **Website Kamu Berhasil Aktif!**\n\n"
+                f"🔗 Link Website:\n{site_url}",
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text(
+                f"⚠️ **Netlify Deploy Log:**\n```\n{result.stdout[-400:]}\n```",
+                parse_mode="Markdown"
+            )
 
-        await status_msg.edit_text(
-            f"✅ **Website Kamu Sudah Aktif!**\n\n"
-            f"🔗 Klik link di bawah untuk melihat:\n{site_url}",
-            parse_mode="Markdown"
-        )
-
-    except subprocess.CalledProcessError as e:
-        await status_msg.edit_text(f"❌ Gagal menjalankan OpenCode/Deploy. Exit code: {e.returncode}")
     except Exception as e:
         await status_msg.edit_text(f"❌ Terjadi kesalahan: {str(e)}")
 
