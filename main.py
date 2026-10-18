@@ -9,6 +9,38 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+async def generate_with_gemini_fallback(prompt_text: str) -> str:
+    """Fallback jika OpenCode error: Panggil Gemini API langsung via HTTP Request"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    
+    system_instruction = (
+        "You are an expert web developer. Create a complete, single-file HTML website with Tailwind CSS (via CDN) "
+        "and JavaScript based on the user's request. Output ONLY valid HTML code starting with <!DOCTYPE html> and ending with </html>. "
+        "Do not include Markdown formatting or extra text outside the HTML code."
+    )
+    
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": f"{system_instruction}\n\nUser Request: {prompt_text}"}]
+            }
+        ]
+    }
+    
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        raw_html = data['candidates'][0]['content']['parts'][0]['text']
+        # Clean markdown code blocks if present
+        clean_html = re.sub(r'```html\s*', '', raw_html, flags=re.IGNORECASE)
+        clean_html = re.sub(r'```\s*$', '', clean_html).strip()
+        return clean_html
+    else:
+        raise Exception(f"Gemini API Error {response.status_code}: {response.text}")
 
 async def create_github_repo(repo_name: str):
     url = "https://api.github.com/user/repos"
@@ -40,69 +72,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repo_name = f"web-ai-{chat_id}-{message_id}"
 
     try:
-        clean_prompt = user_prompt.replace('"', '').replace("'", "")
-        prompt = (
-            f"Generate a single-file responsive website HTML page using Tailwind CSS for: {clean_prompt}. "
-            f"Output ONLY valid HTML code including <!DOCTYPE html>."
-        )
+        await status_msg.edit_text("🤖 [2/3] AI sedang merancang & menulis kode HTML...")
 
-        await status_msg.edit_text("🤖 [2/3] OpenCode AI sedang merancang & menulis kode...")
+        html_content = None
 
-        # 1. Jalankan OpenCode dan tangkap output teksnya
-        process = subprocess.run(
-            f'opencode "{prompt}"', 
-            shell=True, 
-            cwd=work_dir, 
-            capture_output=True, 
-            text=True
-        )
+        # 1. Coba eksekusi via OpenCode dengan file prompt untuk menghindari error ENAMETOOLONG
+        prompt_file = os.path.join(work_dir, "prompt.txt")
+        with open(prompt_file, "w", encoding="utf-8") as f:
+            f.write(user_prompt)
 
-        # 2. Cek apakah ada file .html yang langsung terbuat di workspace
-        html_files = glob.glob(f"{work_dir}/**/*.html", recursive=True)
-
-        # Jika OpenCode tidak membuat file, tetapi mengembalikan teks kode HTML di stdout
-        if not html_files and process.stdout:
-            stdout_text = process.stdout
-            # Ekstrak kode HTML dari output (jika dibungkus ```html ... ```)
-            html_match = re.search(r'<!DOCTYPE html>.*</html>', stdout_text, re.DOTALL | re.IGNORECASE)
-            if not html_match:
-                html_match = re.search(r'<html.*</html>', stdout_text, re.DOTALL | re.IGNORECASE)
-
-            if html_match:
-                code_content = html_match.group(0)
-            elif "<head>" in stdout_text or "<body>" in stdout_text:
-                code_content = stdout_text
-            else:
-                code_content = None
-
-            if code_content:
-                # Tulis langsung kode HTML yang ditangkap ke file index.html
-                index_path = os.path.join(work_dir, "index.html")
-                with open(index_path, "w", encoding="utf-8") as f:
-                    f.write(code_content)
-                html_files = [index_path]
-
-        # 3. Jika tetap tidak ada file HTML dan tidak ada output valid
-        if not html_files:
-            all_files = os.listdir(work_dir)
-            log_output = (process.stderr or process.stdout or "Tidak ada output")[:300]
-            await status_msg.edit_text(
-                f"❌ **OpenCode tidak menghasilkan file atau kode HTML.**\n\n"
-                f"📂 Isi folder: `{all_files}`\n"
-                f"⚠️ Output/Log Terminal: `{log_output}`\n\n"
-                f"💡 *Pastikan `GEMINI_API_KEY` sudah terpasang di Variables Railway.*",
-                parse_mode="Markdown"
+        try:
+            process = subprocess.run(
+                f'opencode < "{prompt_file}"', 
+                shell=True, 
+                cwd=work_dir, 
+                capture_output=True, 
+                text=True,
+                timeout=30
             )
-            return
+            # Cek jika ada file HTML hasil opencode
+            html_files = glob.glob(f"{work_dir}/**/*.html", recursive=True)
+            if html_files:
+                with open(html_files[0], "r", encoding="utf-8") as f:
+                    html_content = f.read()
+        except Exception:
+            pass
 
-        target_html = html_files[0]
+        # 2. Jika OpenCode gagal/tidak menghasilkan HTML, gunakan Gemini API langsung
+        if not html_content:
+            html_content = await generate_with_gemini_fallback(user_prompt)
+
+        # Simpan hasil akhir ke index.html
         index_path = os.path.join(work_dir, "index.html")
-        if target_html != index_path:
-            os.rename(target_html, index_path)
+        with open(index_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
 
         await status_msg.edit_text("🐙 [3/3] Membuat repository & mengunggah ke GitHub...")
 
-        # 4. Buat Repository di GitHub dan Push
+        # 3. Buat Repository di GitHub & Push
         repo_url = await create_github_repo(repo_name)
         auth_repo_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
         
