@@ -11,9 +11,12 @@ GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
-    """Memanggil Google Gemini API menggunakan endpoint model terbaru"""
-    # Menggunakan model gemini-2.5-flash / gemini-2.0-flash terbaru
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    """Memanggil Google Gemini API dengan URL bersih tanpa string/format error"""
+    # Pastikan API Key bersih dari spasi atau karakter tak terlihat
+    clean_key = GEMINI_API_KEY.strip() if GEMINI_API_KEY else ""
+    
+    # URL murni
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={clean_key}"
     headers = {"Content-Type": "application/json"}
     
     system_instruction = (
@@ -33,28 +36,30 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
     }
     
     response = requests.post(url, headers=headers, json=payload, timeout=60)
-    
-    # Fallback ke gemini-2.0-flash jika gemini-2.5-flash belum tersedia di region tertentu
+
+    # Jika gemini-2.0-flash tidak ditemukan, fallback ke gemini-1.5-flash
     if response.status_code == 404:
-        url_fallback = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=){GEMINI_API_KEY}"
+        url_fallback = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){clean_key}"
         response = requests.post(url_fallback, headers=headers, json=payload, timeout=60)
 
     if response.status_code == 200:
         data = response.json()
         raw_html = data['candidates'][0]['content']['parts'][0]['text']
         
-        # Bersihkan format markdown ```html
+        # Bersihkan jika ada pembungkus markdown ```html
         clean_html = re.sub(r'```html\s*', '', raw_html, flags=re.IGNORECASE)
         clean_html = re.sub(r'```\s*$', '', clean_html).strip()
         return clean_html
     else:
-        raise Exception(f"Gemini API Error ({response.status_code}): {response.text}")
+        # Sembunyikan API key jika ada error agar log aman
+        err_msg = response.text.replace(clean_key, "HIDDEN_KEY")
+        raise Exception(f"Gemini API Error ({response.status_code}): {err_msg}")
 
 async def create_github_repo(repo_name: str):
     """Membuat Repository publik baru di GitHub"""
     url = "https://api.github.com/user/repos"
     headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
+        "Authorization": f"token {GITHUB_TOKEN.strip() if GITHUB_TOKEN else ''}",
         "Accept": "application/vnd.github.v3+json"
     }
     payload = {
@@ -83,19 +88,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await status_msg.edit_text("🤖 [2/3] Gemini AI sedang merancang & menulis kode HTML...")
 
-        # 1. Minta Gemini API merancang website
+        # 1. Panggil Gemini API
         html_code = await generate_html_with_gemini(user_prompt)
 
-        # 2. Simpan hasilnya langsung ke file index.html
+        # 2. Simpan ke index.html
         index_path = os.path.join(work_dir, "index.html")
         with open(index_path, "w", encoding="utf-8") as f:
             f.write(html_code)
 
         await status_msg.edit_text("🐙 [3/3] Membuat repository & mengunggah ke GitHub...")
 
-        # 3. Buat Repo di GitHub & Push kodenya
+        # 3. Buat Repo di GitHub & Push
         repo_url = await create_github_repo(repo_name)
-        auth_repo_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
+        auth_repo_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN.strip()}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
         
         commands = [
             ["git", "init"],
@@ -114,7 +119,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             f"✅ **Website Berhasil Dibuat & Diunggah ke GitHub!**\n\n"
             f"📦 **Repository GitHub Kamu:**\n{repo_url}\n\n"
-            f"💡 *Kamu bisa melihat file index.html di GitHub tersebut.*",
+            f"💡 *Kamu bisa melihat file index.html di dalamnya.*",
             parse_mode="Markdown"
         )
 
