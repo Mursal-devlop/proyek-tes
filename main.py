@@ -55,6 +55,36 @@ Ketentuan:
 9. Jangan mengarang hasil integrasi backend yang sebenarnya belum tersedia.
 """
 
+CLASSIFIER_INSTRUCTION = """
+Kamu adalah pengklasifikasi niat (intent) pesan pengguna.
+
+Tentukan apakah pesan pengguna meminta dibuatkan website/halaman web.
+
+Balas HANYA dengan satu kata, tanpa penjelasan:
+- WEBSITE : pengguna meminta dibuatkan website/halaman web secara langsung.
+            Contoh: "buatkan website toko", "bikin landing page", "buatkan
+            portfolio html".
+- CHAT    : semua permintaan lain, termasuk sapaan, pertanyaan umum,
+            tugas sekolah, matematika, coding, curhat, terjemahan, dan
+            pertanyaan "bagaimana cara membuat website" (hanya tanya,
+            bukan minta dibuatkan).
+"""
+
+CHAT_INSTRUCTION = """
+Kamu adalah asisten AI yang ramah, sopan, dan membantu, seperti chatbot
+pada umumnya.
+
+Aturan:
+1. Jawab dengan bahasa yang sama dengan pengguna (default Bahasa Indonesia).
+2. Jika pengguna menyapa, balas sapaan dengan ramah dan tawarkan bantuan.
+3. Jika pengguna meminta bantuan tugas sekolah (matematika, IPA, IPS,
+   bahasa, sejarah, dsb), bantu selesaikan dengan langkah yang jelas.
+   Untuk soal hitungan, tunjukkan cara penyelesaiannya, bukan hanya hasil.
+4. Jawab dengan jelas, ringkas, dan terstruktur. Gunakan poin bila perlu.
+5. Jangan mengarang fakta. Jika tidak tahu, katakan dengan jujur.
+6. Jangan menampilkan kode HTML website kecuali diminta secara eksplisit.
+"""
+
 
 # ==================================================
 # VALIDASI KONFIGURASI
@@ -84,6 +114,104 @@ def validate_config():
 # GEMINI AI
 # ==================================================
 
+def _call_gemini_sync(
+    system_instruction,
+    user_prompt,
+    temperature,
+    max_output_tokens,
+    previous_interaction_id=None,
+    store=False,
+):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    # API Gemini terbaru menyarankan Interactions API.
+    # Jika SDK lama, fallback ke generate_content.
+    if hasattr(client, "interactions"):
+        kwargs = {
+            "model": GEMINI_MODEL,
+            "input": user_prompt,
+            "system_instruction": system_instruction,
+            "generation_config": {
+                "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+            },
+            "store": store,
+        }
+        if previous_interaction_id:
+            kwargs["previous_interaction_id"] = previous_interaction_id
+
+        response = client.interactions.create(**kwargs)
+
+        return (
+            getattr(response, "output_text", None),
+            getattr(response, "id", None),
+            response,
+        )
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        ),
+    )
+    return getattr(response, "text", None), None, response
+
+
+async def _call_gemini(
+    system_instruction,
+    user_prompt,
+    temperature=0.4,
+    max_output_tokens=16000,
+    previous_interaction_id=None,
+    store=False,
+):
+    return await asyncio.to_thread(
+        _call_gemini_sync,
+        system_instruction,
+        user_prompt,
+        temperature,
+        max_output_tokens,
+        previous_interaction_id,
+        store,
+    )
+
+
+async def classify_request(user_prompt: str) -> str:
+    try:
+        text, _, _ = await _call_gemini(
+            CLASSIFIER_INSTRUCTION,
+            user_prompt,
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+    except Exception:
+        return "chat"
+
+    if text and "website" in text.lower():
+        return "website"
+
+    return "chat"
+
+
+async def answer_general(user_prompt, previous_interaction_id=None):
+    text, interaction_id, _ = await _call_gemini(
+        CHAT_INSTRUCTION,
+        user_prompt,
+        temperature=0.7,
+        max_output_tokens=4000,
+        previous_interaction_id=previous_interaction_id,
+        store=True,
+    )
+
+    if not text or not text.strip():
+        raise RuntimeError("Gemini tidak menghasilkan jawaban.")
+
+    return text.strip(), interaction_id
+
+
 async def generate_html_with_gemini(user_prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError(
@@ -91,40 +219,12 @@ async def generate_html_with_gemini(user_prompt: str) -> str:
         )
 
     try:
-        # SDK Gemini bersifat sinkron, jadi jalankan di thread
-        # agar bot Telegram tetap responsif.
-        def generate():
-            client = genai.Client(api_key=GEMINI_API_KEY)
-
-            # API Gemini terbaru menyarankan Interactions API.
-            # Jika SDK lama, fallback ke generate_content.
-            if hasattr(client, "interactions"):
-                return client.interactions.create(
-                    model=GEMINI_MODEL,
-                    input=user_prompt,
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    generation_config={
-                        "temperature": 0.4,
-                        "max_output_tokens": 16000,
-                    },
-                    store=False,
-                )
-
-            return client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    temperature=0.4,
-                    max_output_tokens=16000,
-                ),
-            )
-
-        response = await asyncio.to_thread(generate)
-
-        raw_html = getattr(response, "output_text", None)
-        if raw_html is None:
-            raw_html = getattr(response, "text", None)
+        raw_html, _, response = await _call_gemini(
+            SYSTEM_INSTRUCTION,
+            user_prompt,
+            temperature=0.4,
+            max_output_tokens=16000,
+        )
 
         if not raw_html or not raw_html.strip():
             status = getattr(response, "status", "")
@@ -367,12 +467,14 @@ async def start_command(
 ):
     if update.message:
         await update.message.reply_text(
-            "Halo! Kirim deskripsi website yang ingin kamu buat.\n\n"
-            "Contoh:\n"
-            "Buat website toko kopi modern dengan katalog produk, "
-            "keranjang sederhana, dan desain responsif.\n\n"
-            "Bot akan membuat index.html menggunakan Gemini "
-            "dan mengunggahnya ke GitHub."
+            "Halo! Aku asisten AI. Kamu bisa:\n\n"
+            "1. Ngobrol santai atau tanya apa saja.\n"
+            "2. Minta bantuan tugas sekolah (matematika, IPA, IPS, "
+            "bahasa, dsb) — akan dijelaskan langkahnya.\n"
+            "3. Minta dibuatkan website. Contoh:\n"
+            "\"Buat website toko kopi modern dengan katalog produk.\"\n"
+            "Website akan otomatis diunggah ke GitHub Pages dan "
+            "aku kirim link-nya."
         )
 
 
@@ -400,6 +502,19 @@ def redact_secrets(text: str) -> str:
     return text
 
 
+TELEGRAM_MAX_MESSAGE = 4000
+
+
+async def send_long_message(message, text: str):
+    chunks = [
+        text[i:i + TELEGRAM_MAX_MESSAGE]
+        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE)
+    ] or [""]
+
+    for chunk in chunks:
+        await message.reply_text(chunk)
+
+
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -411,10 +526,43 @@ async def handle_message(
     chat_id = update.effective_chat.id
     message_id = update.message.message_id
 
-    if len(user_prompt) < 5:
-        await update.message.reply_text(
-            "Prompt terlalu singkat. Jelaskan website yang ingin dibuat."
+    if not user_prompt:
+        return
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=chat_id,
+            action="typing",
         )
+    except TelegramError:
+        pass
+
+    intent = await classify_request(user_prompt)
+
+    if intent != "website":
+        chat_data = (
+            context.chat_data
+            if context and context.chat_data is not None
+            else {}
+        )
+
+        try:
+            answer, interaction_id = await answer_general(
+                user_prompt,
+                chat_data.get("last_interaction_id"),
+            )
+
+            if interaction_id:
+                chat_data["last_interaction_id"] = interaction_id
+
+            await send_long_message(update.message, answer)
+
+        except Exception as exc:
+            detail = redact_secrets(str(exc))[:2500]
+            await update.message.reply_text(
+                f"❌ Terjadi kesalahan:\n{detail}"
+            )
+
         return
 
     status_msg = await update.message.reply_text(
