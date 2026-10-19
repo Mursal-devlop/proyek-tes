@@ -179,7 +179,71 @@ async def _call_gemini(
     )
 
 
+WEBSITE_TERMS = (
+    "website",
+    "web page",
+    "webpage",
+    "landing page",
+    "situs",
+    "web app",
+    "web toko",
+    "html",
+)
+
+EXPLAIN_TERMS = (
+    "cara",
+    "jelaskan",
+    "tutorial",
+    "apa itu",
+    "pengertian",
+    "belajar",
+)
+
+BUILD_TERMS = (
+    "buat",
+    "bikin",
+    "buatkan",
+    "bikinin",
+    "bikinlah",
+    "membuat",
+    "generate",
+    "create",
+    "rancang",
+    "desain",
+    "design",
+    "tolong",
+)
+
+STRONG_WEBSITE_TERMS = (
+    "landing page",
+    "web page",
+    "webpage",
+    "situs",
+    "web toko",
+)
+
+
+def looks_like_website_request(text: str) -> bool:
+    lowered = text.lower()
+
+    if any(term in lowered for term in STRONG_WEBSITE_TERMS):
+        return True
+
+    has_web = any(term in lowered for term in WEBSITE_TERMS)
+    has_build = any(term in lowered for term in BUILD_TERMS)
+    has_explain = any(term in lowered for term in EXPLAIN_TERMS)
+
+    if has_web and has_build and not has_explain:
+        return True
+
+    return False
+
+
 async def classify_request(user_prompt: str) -> str:
+    # Deteksi cepat: permintaan website yang jelas tidak perlu panggil API.
+    if looks_like_website_request(user_prompt):
+        return "website"
+
     try:
         text, _, _ = await _call_gemini(
             CLASSIFIER_INSTRUCTION,
@@ -474,8 +538,31 @@ async def start_command(
             "3. Minta dibuatkan website. Contoh:\n"
             "\"Buat website toko kopi modern dengan katalog produk.\"\n"
             "Website akan otomatis diunggah ke GitHub Pages dan "
-            "aku kirim link-nya."
+            "aku kirim link-nya.\n\n"
+            "Mau langsung buat website? Kirim /web <deskripsi>."
         )
+
+
+async def web_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message:
+        return
+
+    user_prompt = " ".join(context.args or []).strip()
+
+    if not user_prompt:
+        await update.message.reply_text(
+            "Gunakan: /web <deskripsi website>\n"
+            "Contoh: /web website toko kopi modern"
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    message_id = update.message.message_id
+
+    await build_website(update, user_prompt, chat_id, message_id)
 
 
 def redact_secrets(text: str) -> str:
@@ -539,32 +626,35 @@ async def handle_message(
 
     intent = await classify_request(user_prompt)
 
-    if intent != "website":
-        chat_data = (
-            context.chat_data
-            if context and context.chat_data is not None
-            else {}
-        )
-
-        try:
-            answer, interaction_id = await answer_general(
-                user_prompt,
-                chat_data.get("last_interaction_id"),
-            )
-
-            if interaction_id:
-                chat_data["last_interaction_id"] = interaction_id
-
-            await send_long_message(update.message, answer)
-
-        except Exception as exc:
-            detail = redact_secrets(str(exc))[:2500]
-            await update.message.reply_text(
-                f"❌ Terjadi kesalahan:\n{detail}"
-            )
-
+    if intent == "website":
+        await build_website(update, user_prompt, chat_id, message_id)
         return
 
+    chat_data = (
+        context.chat_data
+        if context and context.chat_data is not None
+        else {}
+    )
+
+    try:
+        answer, interaction_id = await answer_general(
+            user_prompt,
+            chat_data.get("last_interaction_id"),
+        )
+
+        if interaction_id:
+            chat_data["last_interaction_id"] = interaction_id
+
+        await send_long_message(update.message, answer)
+
+    except Exception as exc:
+        detail = redact_secrets(str(exc))[:2500]
+        await update.message.reply_text(
+            f"❌ Terjadi kesalahan:\n{detail}"
+        )
+
+
+async def build_website(update, user_prompt, chat_id, message_id):
     status_msg = await update.message.reply_text(
         "⏳ [1/3] Menyiapkan workspace..."
     )
@@ -655,6 +745,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("web", web_command))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
