@@ -3,6 +3,7 @@ import os
 import re
 import base64
 import shutil
+import logging
 import asyncio
 import subprocess
 from pathlib import Path
@@ -20,6 +21,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("web-ai-bot")
 
 # ==================================================
 # KONFIGURASI
@@ -55,34 +62,18 @@ Ketentuan:
 9. Jangan mengarang hasil integrasi backend yang sebenarnya belum tersedia.
 """
 
-CLASSIFIER_INSTRUCTION = """
-Kamu adalah pengklasifikasi niat (intent) pesan pengguna.
-
-Tentukan apakah pesan pengguna meminta dibuatkan website/halaman web.
-
-Balas HANYA dengan satu kata, tanpa penjelasan:
-- WEBSITE : pengguna meminta dibuatkan website/halaman web secara langsung.
-            Contoh: "buatkan website toko", "bikin landing page", "buatkan
-            portfolio html".
-- CHAT    : semua permintaan lain, termasuk sapaan, pertanyaan umum,
-            tugas sekolah, matematika, coding, curhat, terjemahan, dan
-            pertanyaan "bagaimana cara membuat website" (hanya tanya,
-            bukan minta dibuatkan).
-"""
-
 CHAT_INSTRUCTION = """
-Kamu adalah asisten AI yang ramah, sopan, dan membantu, seperti chatbot
-pada umumnya.
+Kamu adalah asisten bot Telegram yang ramah.
+
+Tugasmu hanya dua:
+1. Membalas sapaan dan obrolan ringan dengan ramah.
+2. Jika pengguna ingin membuat website, arahkan dia untuk menulis
+   permintaan seperti "buatkan website ...".
 
 Aturan:
-1. Jawab dengan bahasa yang sama dengan pengguna (default Bahasa Indonesia).
-2. Jika pengguna menyapa, balas sapaan dengan ramah dan tawarkan bantuan.
-3. Jika pengguna meminta bantuan tugas sekolah (matematika, IPA, IPS,
-   bahasa, sejarah, dsb), bantu selesaikan dengan langkah yang jelas.
-   Untuk soal hitungan, tunjukkan cara penyelesaiannya, bukan hanya hasil.
-4. Jawab dengan jelas, ringkas, dan terstruktur. Gunakan poin bila perlu.
-5. Jangan mengarang fakta. Jika tidak tahu, katakan dengan jujur.
-6. Jangan menampilkan kode HTML website kecuali diminta secara eksplisit.
+- Jawab singkat, maksimal 3 kalimat, dalam Bahasa Indonesia.
+- Jangan mengerjakan tugas sekolah, PR, atau soal hitungan.
+- Jangan menuliskan kode HTML/kode program.
 """
 
 
@@ -179,101 +170,45 @@ async def _call_gemini(
     )
 
 
-WEBSITE_TERMS = (
-    "website",
-    "web page",
-    "webpage",
-    "landing page",
-    "situs",
-    "web app",
-    "web toko",
-    "html",
+WEBSITE_PATTERN = re.compile(
+    r"\b(website|web|situs|html|webpage|web\s*page|landing\s*page|"
+    r"web\s*app|web\s*toko|toko\s*online|portofolio|portfolio)\b",
+    re.IGNORECASE,
 )
 
-EXPLAIN_TERMS = (
-    "cara",
-    "jelaskan",
-    "tutorial",
-    "apa itu",
-    "pengertian",
-    "belajar",
-)
-
-BUILD_TERMS = (
-    "buat",
-    "bikin",
-    "buatkan",
-    "bikinin",
-    "bikinlah",
-    "membuat",
-    "generate",
-    "create",
-    "rancang",
-    "desain",
-    "design",
-    "tolong",
-)
-
-STRONG_WEBSITE_TERMS = (
-    "landing page",
-    "web page",
-    "webpage",
-    "situs",
-    "web toko",
+EXPLAIN_PATTERN = re.compile(
+    r"\b(cara|bagaimana|gimana|jelaskan|tutorial|apa itu|pengertian|"
+    r"belajar|kenapa|mengapa|maksud)\b",
+    re.IGNORECASE,
 )
 
 
-def looks_like_website_request(text: str) -> bool:
-    lowered = text.lower()
+def is_website_request(text: str) -> bool:
+    if not text:
+        return False
 
-    if any(term in lowered for term in STRONG_WEBSITE_TERMS):
-        return True
+    if not WEBSITE_PATTERN.search(text):
+        return False
 
-    has_web = any(term in lowered for term in WEBSITE_TERMS)
-    has_build = any(term in lowered for term in BUILD_TERMS)
-    has_explain = any(term in lowered for term in EXPLAIN_TERMS)
+    # Pertanyaan penjelasan tidak dianggap permintaan membuat.
+    if EXPLAIN_PATTERN.search(text):
+        return False
 
-    if has_web and has_build and not has_explain:
-        return True
-
-    return False
+    return True
 
 
-async def classify_request(user_prompt: str) -> str:
-    # Deteksi cepat: permintaan website yang jelas tidak perlu panggil API.
-    if looks_like_website_request(user_prompt):
-        return "website"
-
-    try:
-        text, _, _ = await _call_gemini(
-            CLASSIFIER_INSTRUCTION,
-            user_prompt,
-            temperature=0.0,
-            max_output_tokens=8,
-        )
-    except Exception:
-        return "chat"
-
-    if text and "website" in text.lower():
-        return "website"
-
-    return "chat"
-
-
-async def answer_general(user_prompt, previous_interaction_id=None):
-    text, interaction_id, _ = await _call_gemini(
+async def answer_general(user_prompt):
+    text, _, _ = await _call_gemini(
         CHAT_INSTRUCTION,
         user_prompt,
         temperature=0.7,
-        max_output_tokens=4000,
-        previous_interaction_id=previous_interaction_id,
-        store=True,
+        max_output_tokens=500,
     )
 
     if not text or not text.strip():
         raise RuntimeError("Gemini tidak menghasilkan jawaban.")
 
-    return text.strip(), interaction_id
+    return text.strip()
 
 
 async def generate_html_with_gemini(user_prompt: str) -> str:
@@ -472,6 +407,7 @@ async def push_to_github(work_dir: Path, repo_name: str):
             f"http.https://github.com/.extraheader="
             f"AUTHORIZATION: basic {basic_auth}",
             "push",
+            "--force",
             "-u",
             "origin",
             "main",
@@ -531,15 +467,12 @@ async def start_command(
 ):
     if update.message:
         await update.message.reply_text(
-            "Halo! Aku asisten AI. Kamu bisa:\n\n"
-            "1. Ngobrol santai atau tanya apa saja.\n"
-            "2. Minta bantuan tugas sekolah (matematika, IPA, IPS, "
-            "bahasa, dsb) — akan dijelaskan langkahnya.\n"
-            "3. Minta dibuatkan website. Contoh:\n"
-            "\"Buat website toko kopi modern dengan katalog produk.\"\n"
-            "Website akan otomatis diunggah ke GitHub Pages dan "
-            "aku kirim link-nya.\n\n"
-            "Mau langsung buat website? Kirim /web <deskripsi>."
+            "Halo! Saya bot pembuat website.\n\n"
+            "Kirim deskripsi website yang kamu mau, contoh:\n"
+            "\"Buat website toko kopi modern dengan katalog produk.\"\n\n"
+            "Website akan dibuat, diunggah ke GitHub Pages, lalu "
+            "saya kirim link-nya untuk langsung dibuka.\n\n"
+            "Ingin langsung? Kirim: /web <deskripsi website>"
         )
 
 
@@ -589,19 +522,6 @@ def redact_secrets(text: str) -> str:
     return text
 
 
-TELEGRAM_MAX_MESSAGE = 4000
-
-
-async def send_long_message(message, text: str):
-    chunks = [
-        text[i:i + TELEGRAM_MAX_MESSAGE]
-        for i in range(0, len(text), TELEGRAM_MAX_MESSAGE)
-    ] or [""]
-
-    for chunk in chunks:
-        await message.reply_text(chunk)
-
-
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -624,30 +544,19 @@ async def handle_message(
     except TelegramError:
         pass
 
-    intent = await classify_request(user_prompt)
+    intent = "website" if is_website_request(user_prompt) else "chat"
+    logger.info("[%s] pesan=%r intent=%s", chat_id, user_prompt, intent)
 
     if intent == "website":
         await build_website(update, user_prompt, chat_id, message_id)
         return
 
-    chat_data = (
-        context.chat_data
-        if context and context.chat_data is not None
-        else {}
-    )
-
     try:
-        answer, interaction_id = await answer_general(
-            user_prompt,
-            chat_data.get("last_interaction_id"),
-        )
-
-        if interaction_id:
-            chat_data["last_interaction_id"] = interaction_id
-
-        await send_long_message(update.message, answer)
+        answer = await answer_general(user_prompt)
+        await update.message.reply_text(answer)
 
     except Exception as exc:
+        logger.exception("Gagal membalas chat")
         detail = redact_secrets(str(exc))[:2500]
         await update.message.reply_text(
             f"❌ Terjadi kesalahan:\n{detail}"
@@ -655,8 +564,10 @@ async def handle_message(
 
 
 async def build_website(update, user_prompt, chat_id, message_id):
+    logger.info("[%s] mulai membuat website: %r", chat_id, user_prompt)
+
     status_msg = await update.message.reply_text(
-        "⏳ [1/3] Menyiapkan workspace..."
+        "⏳ [1/4] Menyiapkan workspace..."
     )
 
     work_dir = WORKSPACE_DIR / f"{chat_id}_{message_id}"
@@ -666,31 +577,35 @@ async def build_website(update, user_prompt, chat_id, message_id):
         work_dir.mkdir(parents=True, exist_ok=True)
 
         await status_msg.edit_text(
-            "🤖 [2/3] Gemini sedang membuat website..."
+            "🤖 [2/4] Gemini sedang membuat website..."
         )
 
         html_code = await generate_html_with_gemini(user_prompt)
+        logger.info("[%s] HTML dibuat (%d karakter)", chat_id, len(html_code))
 
         index_path = work_dir / "index.html"
         index_path.write_text(html_code, encoding="utf-8")
 
         await status_msg.edit_text(
-            "🐙 [3/3] Menyiapkan repository dan mengunggah ke GitHub..."
+            "🐙 [3/4] Mengunggah ke GitHub..."
         )
 
         repo_url = await create_github_repo(repo_name)
         await push_to_github(work_dir, repo_name)
+        logger.info("[%s] terunggah ke %s", chat_id, repo_url)
 
         await status_msg.edit_text(
-            "🌐 Mengaktifkan GitHub Pages agar link bisa langsung dibuka..."
+            "🌐 [4/4] Mengaktifkan GitHub Pages..."
         )
 
         pages_url = None
         pages_error = None
         try:
             pages_url = await enable_github_pages(repo_name)
+            logger.info("[%s] halaman live: %s", chat_id, pages_url)
         except Exception as exc:
             pages_error = redact_secrets(str(exc))
+            logger.warning("[%s] GitHub Pages gagal: %s", chat_id, pages_error)
 
         if pages_url:
             await status_msg.edit_text(
@@ -715,6 +630,7 @@ async def build_website(update, user_prompt, chat_id, message_id):
         # environment variable atau kredensial ke pengguna.
         detail = (exc.stderr or exc.stdout or str(exc)).strip()
         detail = redact_secrets(detail)[-1200:]
+        logger.error("[%s] git gagal: %s", chat_id, detail)
 
         await status_msg.edit_text(
             "❌ Proses Git gagal.\n\n"
@@ -723,6 +639,7 @@ async def build_website(update, user_prompt, chat_id, message_id):
 
     except Exception as exc:
         detail = redact_secrets(str(exc))[:2500]
+        logger.exception("[%s] gagal membuat website", chat_id)
         try:
             await status_msg.edit_text(
                 f"❌ Terjadi kesalahan:\n{detail}"
